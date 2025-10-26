@@ -1,5 +1,4 @@
-//EEPROM FUNCTIONS
-
+// EEPROM functions
 void EEPROM_write(unsigned int uiAddress, unsigned char ucData) {
   while (EECR & (1 << EEPE));
   EEAR = uiAddress;
@@ -16,16 +15,16 @@ unsigned char EEPROM_read(unsigned int uiAddress) {
 }
 
 // pin assignments
-
-const byte colPins[3] = {6, 7, 8}; // keypad columns
+const byte colPins[3] = {8, 7, 6}; // keypad columns
 const byte AROW = A0;               // analog input row line
 
-const int GREEN_LED  = 4; // unlocked
-const int YELLOW_LED = 3; // recording
-const int RED_LED    = 2; // locked
+const int GREEN_LED  = 3; // unlocked
+const int YELLOW_LED = 4; // recording
+const int RED_LED    = 5; // locked
+const int BUZZER_PIN = 9; // piezo buzzer
 
-const int ROW_ADC_TARGETS[4] = {133, 254, 367, 512}; // adc target values
-const int ROW_TOL = 30; // adc value tolerance
+const int ROW_ADC_TARGETS[4] = {133, 254, 367, 512}; // target adc values
+const int ROW_TOL = 30; // adc tolerance range
 
 char keys[4][3] = {
   {'1','2','3'},
@@ -34,33 +33,36 @@ char keys[4][3] = {
   {'*','0','#'}
 };
 
+// state variables and global variables
+bool recording = false;
+bool unlocked  = false;
 int addr = 0;
-int enable = 0;  // 0 = verify/locked, 1 = recording
+bool match = true;  // tracks if keys so far matched stored password
 
+// keypad functions
 int identifyRow(int adc){
   for (int r = 0; r < 4; r++){
-    if (abs(adc - ROW_ADC_TARGETS[r]) <= ROW_TOL) // find row by reading adc
+    if (abs(adc - ROW_ADC_TARGETS[r]) <= ROW_TOL)
       return r;
   }
-  return -1; // no adc value reading
+  return -1; 
 }
 
 void setColumn(int colId){
   for (int i = 0; i < 3; i++)
     pinMode(colPins[i], INPUT_PULLUP);
-
   if (colId >= 0 && colId < 3){
     pinMode(colPins[colId], OUTPUT);
-    digitalWrite(colPins[colId], LOW); // set read column low when pressed
+    digitalWrite(colPins[colId], LOW);
   }
   delayMicroseconds(300);
 }
-
+// read key function
 char readKey(){
   for (int c = 0; c < 3; c++){
     setColumn(c);
-    int adc = analogRead(AROW); 
-    int row = identifyRow(adc); // find row from adc
+    int adc = analogRead(AROW);
+    int row = identifyRow(adc);
     if (row != -1){
       delay(20);
       int adc2 = analogRead(AROW);
@@ -80,93 +82,132 @@ char readKey(){
   setColumn(-1);
   return '\0';
 }
-// conditional to find which led should be on, only 1 at a time
-void setLED(bool red, bool yellow, bool green) { 
+
+// led control conditional statements so that one led is on at a time
+void setLED(bool red, bool yellow, bool green) {
   digitalWrite(RED_LED,    red    ? HIGH : LOW);
   digitalWrite(YELLOW_LED, yellow ? HIGH : LOW);
   digitalWrite(GREEN_LED,  green  ? HIGH : LOW);
 }
 
+// buzzer tones
+void playErrorTone() {
+  tone(BUZZER_PIN, 440, 400);
+  delay(400);
+  noTone(BUZZER_PIN);
+}
+void playSuccessTone() {
+  tone(BUZZER_PIN, 880, 300);
+  delay(300);
+  noTone(BUZZER_PIN);
+}
+void playRecordTone() {
+  tone(BUZZER_PIN, 660, 150);
+  delay(150);
+  noTone(BUZZER_PIN);
+}
+
+
 void setup(){
   Serial.begin(9600);
-
+  // set led and buzzer to pins then set it to red/locked default state
   pinMode(GREEN_LED, OUTPUT);
   pinMode(YELLOW_LED, OUTPUT);
   pinMode(RED_LED, OUTPUT);
-  setLED(true, false, false); //default red
+  pinMode(BUZZER_PIN, OUTPUT);
+  setLED(true, false, false); // start locked (red)
 
-  for (int c = 0; c < 3; c++){
+  for (int c = 0; c < 3; c++)
     pinMode(colPins[c], INPUT);
-  }
 
   analogRead(AROW);
 
   Serial.println();
-  Serial.println("Press * to begin saving password, press * again to finish.");
-  Serial.println("Type password to unlock; # returns to lock mode.");
+  Serial.println("Press * to record new password, * again to stop.");
+  Serial.println("# acts as Enter when locked, and Lock when unlocked.");
 }
 
 void loop(){
   char key = readKey();
-  if (key == '\0') return; // idle
+  if (key == '\0') return;
 
-  // recording
-  if (enable == 1){
-    setLED(false, true, false); // yellow ON
-
-    if (key == '*'){
+  // if recording variable true
+  if (recording) {
+    setLED(false, true, false); // led yellow
+    if (key == '*') { // end password save on second press of *
       EEPROM_write(addr, '*');
-      Serial.println("Password saved.");
-      enable = 0;
+      Serial.println("Password saved. Locked.");
+      recording = false;
       addr = 0;
-      setLED(true, false, false); // set red
-    }
+      setLED(true, false, false);
+      playRecordTone();
+      return;
+    }  // save key to address if not lock/enter key #
     else if (key != '#') {
       EEPROM_write(addr, key);
       addr++;
       Serial.print("Stored: "); Serial.println(key);
+      playRecordTone();
     }
     delay(150);
     return;
   }
 
-  // Verify / Locked mode
+  // unlocked mode
+  if (unlocked) {
+    if (key == '#') { // if # pressed act as lock key
+      Serial.println("System locked.");
+      unlocked = false;
+      addr = 0;
+      match = true;
+      setLED(true, false, false);
+      return;
+    }
+    else return;
+  }
+
+  // locked mode
+  if (key == '*') { // if * press then set recording to true and begin record sequence
+    recording = true;
+    addr = 0;
+    Serial.println("Recording... press * again to stop.");
+    setLED(false, true, false);
+    playRecordTone();
+    return;
+  }
+
+  if (key == '#') { // if # key then compare to saved value
+    // When Enter pressed, evaluate
+    char end = EEPROM_read(addr);
+    if (match && end == '*') {
+      Serial.println("Unlocked!");
+      unlocked = true;
+      addr = 0;
+      match = true;
+      setLED(false, false, true);
+      playSuccessTone();
+    } else {
+      Serial.println("Incorrect password. Locked.");
+      addr = 0;
+      match = true;
+      setLED(true, false, false);
+      playErrorTone();
+    }
+    return;
+  }
+
+  // individual input to keypad
   if (key >= '0' && key <= '9') {
-    Serial.print("Input: "); Serial.println(key);
-  }
-
-  if (key == '*'){        // Enter recording mode
-    enable = 1;
-    addr = 0;
-    Serial.println("Recording... press * to stop.");
-    setLED(false, true, false); // yellow on
-  }
-  else if (key == '#'){   // Lock again
-    enable = 0;
-    addr = 0;
-    Serial.println("Locking.");
-    Serial.println("Locked.");
-    setLED(true, false, false); // red on
-  }
-  else {                  // Check password
-    char expected_val = EEPROM_read(addr);
-
-    if (expected_val == (char)0xFF){
+    char expected = EEPROM_read(addr);
+    if (expected == (char)0xFF) {
       Serial.println("No password saved.");
       addr = 0;
-      setLED(true, false, false); // red on
-    }
-    else if (key == expected_val){
+      match = true;
+      setLED(true, false, false);
+    } else {
+      if (key != expected) match = false;
       addr++;
-      if (EEPROM_read(addr) == '*'){
-        Serial.println("Unlocked");
-        addr = 0;
-        setLED(false, false, true); // green on
-      }
-    } 
-    else {
-      addr = 0;
-      setLED(true, false, false); // red on
+      Serial.print("Entered: "); Serial.println(key);
     }
   }
 
