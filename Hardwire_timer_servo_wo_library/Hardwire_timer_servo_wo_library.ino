@@ -28,4 +28,5 @@ void loop() {
 void setServoAngle(int angle) {
   int pulseWidth = map(angle, 0, 180, 1000, 2000); // microseconds
   OCR1A = pulseWidth * 2;  // Timer1 ticks = 0.5 µs at prescaler 8
+  
 }
