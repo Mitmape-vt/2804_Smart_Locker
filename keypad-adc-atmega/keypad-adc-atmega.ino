@@ -408,7 +408,7 @@ void loop(){
       }
     
 
-    // (Optional) use the latest ADC readings
+    //use the latest ADC readings
       addr = 0;
       match = true;
       setLED(false, false, true);
