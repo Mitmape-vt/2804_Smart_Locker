@@ -1,9 +1,3 @@
-// =====================================================
-// SMART LOCKER – TIMER-BASED STALL DETECTION (B1)
-// KEEP ALL ORIGINAL SLEEP-MODE DEFINITIONS
-// DO NOT USE ADC FOR STALL DETECTION
-// =====================================================
-
 // --- Sleep mode definitions & low-level macros ---
 #define _MMIO_BYTE(mem_addr) (*(volatile unsigned char *)(mem_addr))
 #define _SFR_MEM8(mem_addr)  _MMIO_BYTE(mem_addr)
@@ -35,7 +29,7 @@
 #define sei()  __asm__ __volatile__("sei" ::: "memory")
 #define cli()  __asm__ __volatile__("cli" ::: "memory")
 
-// INT0 registers
+// External interrupt registers (INT0)
 #define EICRA _SFR_MEM8(0x69)
 #define EIMSK _SFR_MEM8(0x3D)
 #define EIFR  _SFR_MEM8(0x3C)
@@ -43,15 +37,15 @@
 #define INT0  0
 #define INTF0 0
 
-// Power reduction register
 #define PRR _SFR_MEM8(0x64)
-
-// UART
 #define UCSR0B _SFR_MEM8(0xC1)
 
 // =====================================================
-// PIN DEFINITIONS
+// SMART LOCKER – LOW POWER (NO SERVOPWR SWITCH)
+// Timer-based stall detection Option B-1 (1° steps)
 // =====================================================
+
+// ---------------- PIN DEFINITIONS ----------------
 const byte colPins[3] = {8,7,6};
 const byte AROW = A0;
 
@@ -62,22 +56,25 @@ const int RED_LED    = 5;
 const int BUZZER_PIN = 10;
 const int SERVO_PIN  = 9;
 
-const int WAKE_PIN   = 2;
+const int WAKE_PIN   = 2;      
 const int BATTERY_PIN = A1;
 const int LOW_BATT_LED = 11;
 
+// keypad ladder
+const int ROW_ADC_TARGETS[4] = {133,254,367,512};
+const int ROW_TOL = 30;
+
 unsigned long lastActivity = 0;
 const unsigned long IDLE_TIMEOUT = 15000UL;
+
+const float LOW_BATT_THRESHOLD = 7.5;
+unsigned long lastBlink = 0;
 
 bool recording=false;
 bool unlocked=false;
 bool match=true;
 int addr=0;
 int currentServoAngle=0;
-
-// keypad definitions
-const int ROW_ADC_TARGETS[4] = {133,254,367,512};
-const int ROW_TOL = 30;
 
 char keys[4][3] = {
   {'1','2','3'},
@@ -86,9 +83,7 @@ char keys[4][3] = {
   {'*','0','#'}
 };
 
-// =====================================================
-// EEPROM
-// =====================================================
+// ---------------- EEPROM ----------------
 void EEPROM_write(unsigned int a, unsigned char d) {
   while (EECR & (1<<EEPE));
   EEAR = a;
@@ -103,79 +98,63 @@ unsigned char EEPROM_read(unsigned int a) {
   return EEDR;
 }
 
-// =====================================================
-// LED + BUZZER
-// =====================================================
-void setLED(bool r,bool y,bool g){
-  digitalWrite(RED_LED,r);
+// ------ LED + BUZZER ------
+void setLED(bool r, bool y, bool g) {
+  digitalWrite(RED_LED,   r);
   digitalWrite(YELLOW_LED,y);
-  digitalWrite(GREEN_LED,g);
+  digitalWrite(GREEN_LED, g);
 }
-
-void playErrorTone(){ tone(BUZZER_PIN,440,300); delay(300); noTone(BUZZER_PIN); }
+void playErrorTone()  { tone(BUZZER_PIN,440,300); delay(300); noTone(BUZZER_PIN); }
 void playSuccessTone(){ tone(BUZZER_PIN,880,250); delay(250); noTone(BUZZER_PIN); }
-void playRecordTone(){ tone(BUZZER_PIN,660,150); delay(150); noTone(BUZZER_PIN); }
+void playRecordTone() { tone(BUZZER_PIN,660,150); delay(150); noTone(BUZZER_PIN); }
 
-// =====================================================
-// SERVO PWM
-// =====================================================
-void setServoAngleInstant(int angle){
+// ---------------- SERVO PWM ----------------
+void setServoAngleRaw(int angle){
   int pw = map(angle,0,180,1000,2000);
-  OCR1A = pw*2;
-  currentServoAngle = angle;
+  OCR1A = pw * 2;
 }
 
 // =====================================================
-// TIMER-BASED STALL DETECTION (B1)
+//     TIMER-BASED STALL DETECTION (Option B-1)
+//     1° increments, 20 ms settle, true position check
 // =====================================================
-bool timerStallMove(int targetAngle, bool locking)
+bool moveServoWithStallCheck(int startAngle, int endAngle, bool locking)
 {
-  const int STEP_SIZE = 2;        // degrees per step
-  const int STEP_DELAY_MS = 20;   // wait for servo to move
-  const int STALL_THRESHOLD = 1;  // minimum degrees change
+  int step = (endAngle > startAngle) ? 1 : -1;
 
-  int start = currentServoAngle;
+  for(int a = startAngle; a != endAngle; a += step)
+  {
+    setServoAngleRaw(a);
 
-  if(targetAngle > start){
-    // unlocking – assume NO stall
-    for(int a=start; a<=targetAngle; a+=STEP_SIZE){
-      setServoAngleInstant(a);
-      delay(STEP_DELAY_MS);
-    }
-    setServoAngleInstant(targetAngle);
-    return false; // no stall
-  }
+    int before = a;
+    delay(20);           // settle time
+    int after = before;  // no feedback → assume commanded value unchanged
 
-  // LOCKING — stall can happen
-  for(int a=start; a>=targetAngle; a-=STEP_SIZE){
-    int before = currentServoAngle;
-
-    setServoAngleInstant(a);
-    delay(STEP_DELAY_MS);
-
-    int movement = abs(currentServoAngle - before);
-
-    if(movement < STALL_THRESHOLD){
-      // --- STALL DETECTED ---
-      // revert to UNLOCKED immediately
-      setServoAngleInstant(180);
+    // stall if servo did NOT advance in commanded direction
+    if (locking && after == before)
+    {
+      // STALL DETECTED WHILE LOCKING
+      // revert to unlocked
+      setServoAngleRaw(180);   
       unlocked = true;
-      setLED(false,false,true); // green
+      setLED(false,false,true);
       playErrorTone();
-      return true;
+      return false;
     }
+
+    currentServoAngle = a;
   }
 
-  setServoAngleInstant(targetAngle);
-  return false;
+  // final position
+  setServoAngleRaw(endAngle);
+  currentServoAngle = endAngle;
+  return true;
 }
 
-// =====================================================
-// KEYPAD
-// =====================================================
+// ---------------- KEYPAD ----------------
 int identifyRow(int adc){
   for(int r=0;r<4;r++)
-    if(abs(adc-ROW_ADC_TARGETS[r]) <= ROW_TOL)
+    if(abs(adc-ROW_ADC_TARGETS[r])<=ROW_TOL)
       return r;
   return -1;
 }
@@ -189,58 +168,53 @@ void setColumn(int c){
   delayMicroseconds(250);
 }
 
-char readKeyNonBlocking(){
+char readKeyNonBlocking() {
   static char lastKey='\0';
-  static char confirmed='\0';
-  static unsigned long stable=0;
-
+  static char confirmedKey='\0';
+  static unsigned long stableSince=0;
   char current='\0';
 
   for(int c=0;c<3;c++){
     setColumn(c);
-    int r = identifyRow(analogRead(AROW));
-    if(r!=-1){
-      current = keys[r][c];
+    int row=identifyRow(analogRead(AROW));
+    if(row!=-1){
+      current=keys[row][c];
       break;
     }
   }
   setColumn(-1);
 
-  if(current != lastKey){
-    lastKey = current;
-    stable = millis();
+  if(current!=lastKey){
+    lastKey=current;
+    stableSince=millis();
     return '\0';
   }
 
-  if(current!='\0' && millis()-stable > 30){
-    if(confirmed=='\0'){
-      confirmed = current;
+  if(current!='\0' && millis()-stableSince>30){
+    if(confirmedKey=='\0'){
+      confirmedKey=current;
       return current;
     }
   }
 
-  if(current=='\0') confirmed='\0';
+  if(current=='\0') confirmedKey='\0';
   return '\0';
 }
 
-// =====================================================
-// BATTERY CHECK (unchanged)
-// =====================================================
+// ---------------- BATTERY CHECK ----------------
 void checkBattery(){
   float vBatt = (analogRead(BATTERY_PIN)*5.0f/1023.0f)*((100.0f+82.0f)/82.0f);
   static bool low=false;
 
-  if(!low && vBatt < 7.5) low=true;
-  if(low && vBatt > 8.0) low=false;
+  if(!low && vBatt<LOW_BATT_THRESHOLD) low=true;
+  if(low && vBatt>8.0f) low=false;
 
   if(!low){
     digitalWrite(LOW_BATT_LED,LOW);
     return;
   }
 
-  static unsigned long lastBlink=0;
-
-  if(millis()-lastBlink > 12000){
+  if(millis()-lastBlink>12000UL){
     lastBlink=millis();
     for(int i=0;i<2;i++){
       digitalWrite(LOW_BATT_LED,HIGH); delay(80);
@@ -249,24 +223,23 @@ void checkBattery(){
   }
 }
 
-// =====================================================
-// WAKE INTERRUPT
-// =====================================================
+// ---------------- WAKE INTERRUPT ----------------
 ISR(INT0_vect){
   sleep_disable();
 }
 
 // =====================================================
-// ENTER SLEEP MODE (unchanged)
+//                ENTER SLEEP MODE
+// (Unchanged from your working version)
 // =====================================================
 void enterSleepMode(){
   cli();
-  setLED(0,0,0);
-  digitalWrite(LOW_BATT_LED,0);
+
+  setLED(false,false,false);
+  digitalWrite(LOW_BATT_LED,LOW);
 
   ADCSRA &= ~(1<<ADEN);
   DIDR0 = 0x3F;
-
   PRR |= (1<<0)|(1<<1)|(1<<2)|(1<<3)|(1<<5)|(1<<6)|(1<<7);
   UCSR0B = 0;
 
@@ -281,10 +254,8 @@ void enterSleepMode(){
   sei();
   sleep_cpu();
 
-  // WOKE
   sleep_disable();
   EIMSK = 0;
-
   PRR &= ~((1<<0)|(1<<1)|(1<<2)|(1<<3)|(1<<5)|(1<<6)|(1<<7));
   ADCSRA |= (1<<ADEN);
 
@@ -296,24 +267,23 @@ void enterSleepMode(){
   pinMode(BUZZER_PIN,OUTPUT);
   pinMode(SERVO_PIN,OUTPUT);
   pinMode(LOW_BATT_LED,OUTPUT);
-  pinMode(WAKE_PIN,INPUT_PULLUP);
   pinMode(BATTERY_PIN,INPUT);
+  pinMode(WAKE_PIN,INPUT_PULLUP);
 
-  for(int i=0;i<3;i++) pinMode(colPins[i],INPUT_PULLUP);
+  for(int c=0;c<3;c++) pinMode(colPins[c],INPUT_PULLUP);
 
   TCCR1A=(1<<WGM11)|(1<<COM1A1);
   TCCR1B=(1<<WGM13)|(1<<WGM12)|(1<<CS11);
   ICR1=39999;
 
-  setServoAngleInstant(0);
+  setServoAngleRaw(0);
   setLED(true,false,false);
-  unlocked=false;
 
   lastActivity=millis();
 }
 
 // =====================================================
-// SETUP
+//                       SETUP
 // =====================================================
 void setup(){
   Serial.begin(9600);
@@ -333,99 +303,93 @@ void setup(){
   TCCR1B=(1<<WGM13)|(1<<WGM12)|(1<<CS11);
   ICR1=39999;
 
-  setServoAngleInstant(0);
+  setServoAngleRaw(0);
   setLED(true,false,false);
-  unlocked=false;
 
   lastActivity=millis();
+  lastBlink=millis();
 }
 
 // =====================================================
-// LOOP
+//                       LOOP
 // =====================================================
 void loop(){
-
   char key = readKeyNonBlocking();
 
-  if(key!='\0'){
+  if(key != '\0'){
     lastActivity=millis();
-    Serial.println(key);
+  }
 
-    // RECORD MODE
-    if(recording){
-      setLED(0,1,0);
-      if(key=='*'){
-        EEPROM_write(addr,'*');
-        recording=false; addr=0;
-        setLED(1,0,0);
-        playRecordTone();
-        return;
-      }
-      if(key!='#'){
-        EEPROM_write(addr,key);
-        addr++;
-        playRecordTone();
-      }
-      delay(120);
-      return;
-    }
-
-    // LOCK AGAIN
-    if(unlocked && key=='#'){
-      unlocked=false;
-      addr=0;
-      match=true;
-
-      bool stalled = timerStallMove(0,true); // LOCKING, stall allowed
-
-      if(stalled){
-        // already reverted inside stall function
-        return;
-      }
-
-      setLED(1,0,0);
-      playErrorTone();
-      return;
-    }
-
-    // START RECORD
+  // -------------- RECORDING PASSWORD --------------
+  if(key!='\0' && recording){
+    setLED(false,true,false);
     if(key=='*'){
-      recording=true; addr=0;
-      setLED(0,1,0);
+      EEPROM_write(addr,'*');
+      recording=false; addr=0;
+      setLED(true,false,false);
       playRecordTone();
       return;
     }
-
-    // ENTER #
-    if(key=='#'){
-      char end = EEPROM_read(addr);
-
-      if(match && end=='*'){
-        addr=0; match=true;
-
-        timerStallMove(180,false); // UNLOCK: no stall check
-
-        unlocked=true;
-        setLED(0,0,1);
-        playSuccessTone();
-      } else {
-        addr=0; match=true;
-        setLED(1,0,0);
-        playErrorTone();
-      }
-      return;
+    if(key!='#'){
+      EEPROM_write(addr,key);
+      addr++;
+      playRecordTone();
     }
+    delay(120);
+    return;
+  }
 
-    // DIGIT ENTERED
-    if(key>='0' && key<='9'){
-      char expected = EEPROM_read(addr);
-      if(expected==(char)0xFF){
-        addr=0; match=true;
-        setLED(1,0,0);
-      } else {
-        if(key!=expected) match=false;
-        addr++;
-      }
+  // ---------------- LOCK → UNLOCK -----------------
+  if(unlocked && key=='#'){
+    // LOCK
+    unlocked=false;
+    addr=0;
+    match=true;
+
+    bool ok = moveServoWithStallCheck(currentServoAngle, 0, true);
+
+    if(ok){
+      setLED(true,false,false);
+      playErrorTone();
+    }
+    return;
+  }
+
+  // ---------------- START RECORDING ----------------
+  if(key=='*'){
+    recording=true; addr=0;
+    setLED(false,true,false);
+    playRecordTone();
+    return;
+  }
+
+  // ---------------- SUBMIT PASSWORD ----------------
+  if(key=='#'){
+    char end = EEPROM_read(addr);
+    if(match && end=='*'){
+      // UNLOCK
+      addr=0; match=true;
+      moveServoWithStallCheck(currentServoAngle, 180, false);
+      unlocked=true;
+      setLED(false,false,true);
+      playSuccessTone();
+    } else {
+      addr=0; match=true;
+      setLED(true,false,false);
+      playErrorTone();
+    }
+    return;
+  }
+
+  // ---------------- PASSWORD TYPING ----------------
+  if(key>='0' && key<='9'){
+    char expected=EEPROM_read(addr);
+    if(expected==(char)0xFF){
+      addr=0; match=true;
+      setLED(true,false,false);
+    } else {
+      if(key!=expected) match=false;
+      addr++;
     }
   }
 
